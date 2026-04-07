@@ -644,7 +644,7 @@ func main() {
 			setupLog.Error(err, "unable to create controller", "controller", "ParametersDefinition")
 			os.Exit(1)
 		}
-		if err = (&parameterscontrollers.ParameterReconciler{
+		if err = (&parameterscontrollers.LegacyParameterReconciler{
 			Client:   client,
 			Scheme:   mgr.GetScheme(),
 			Recorder: mgr.GetEventRecorderFor("parameter-controller"),

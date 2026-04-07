@@ -43,6 +43,169 @@ import (
 	"github.com/apecloud/kubeblocks/pkg/parameters/core"
 )
 
+func reconcileConfigItemDetailsIntoSpec(ctx context.Context, cli client.Client, compParam *parametersv1alpha1.ComponentParameter, fetchTask *Task) (bool, error) {
+	configDescs, paramsDefs, err := parameters.ResolveCmpdParametersDefs(ctx, cli, fetchTask.ComponentDefObj)
+	if err != nil {
+		return false, err
+	}
+	if !parameters.HasValidParameterTemplate(configDescs) {
+		return false, nil
+	}
+	templates, err := resolveComponentTemplate(ctx, cli, fetchTask.ComponentDefObj)
+	if err != nil {
+		return false, err
+	}
+	configItemDetails, err := parameters.ClassifyParamsFromConfigTemplate(nil, fetchTask.ComponentDefObj, paramsDefs, templates, configDescs)
+	if err != nil {
+		return false, err
+	}
+	expected := compParam.DeepCopy()
+	expected.Spec.ConfigItemDetails = configItemDetails
+	merged := parameters.MergeComponentParameter(expected, compParam, func(dest, expected *parametersv1alpha1.ConfigTemplateItemDetail) {
+		if len(dest.ConfigFileParams) == 0 && len(expected.ConfigFileParams) != 0 {
+			dest.ConfigFileParams = expected.ConfigFileParams
+		}
+		if dest.CustomTemplates == nil && expected.CustomTemplates != nil {
+			dest.CustomTemplates = expected.CustomTemplates
+		}
+		dest.ConfigSpec = expected.ConfigSpec
+	})
+	if reflect.DeepEqual(compParam.Spec.ConfigItemDetails, merged.Spec.ConfigItemDetails) {
+		return false, nil
+	}
+	patch := client.MergeFrom(compParam.DeepCopy())
+	compParam.Spec.ConfigItemDetails = merged.Spec.ConfigItemDetails
+	return true, cli.Patch(ctx, compParam, patch)
+}
+
+func reconcileParameterValuesIntoSpec(ctx context.Context, cli client.Client, compParam *parametersv1alpha1.ComponentParameter, fetchTask *Task) (bool, error) {
+	specCopy := compParam.Spec.DeepCopy()
+	configmaps, err := resolveComponentRefConfigMap(ctx, cli, compParam.Namespace, compParam.Spec.ClusterName, compParam.Spec.ComponentName)
+	if err != nil {
+		return false, err
+	}
+	configDescs, paramsDefs, err := parameters.ResolveCmpdParametersDefs(ctx, cli, fetchTask.ComponentDefObj)
+	if err != nil {
+		return false, err
+	}
+	if err := applyParameterValues(specCopy, compParam.Spec.Init, false, ctx, cli, fetchTask, configmaps, configDescs, paramsDefs); err != nil {
+		return false, err
+	}
+	if err := applyParameterValues(specCopy, compParam.Spec.Desired, true, ctx, cli, fetchTask, configmaps, configDescs, paramsDefs); err != nil {
+		return false, err
+	}
+	if reflect.DeepEqual(compParam.Spec, *specCopy) {
+		return false, nil
+	}
+	patch := client.MergeFrom(compParam.DeepCopy())
+	compParam.Spec = *specCopy
+	return true, cli.Patch(ctx, compParam, patch)
+}
+
+func applyParameterValues(spec *parametersv1alpha1.ComponentParameterSpec,
+	values *parametersv1alpha1.ParameterValues, override bool,
+	ctx context.Context, cli client.Client, fetchTask *Task,
+	configmaps map[string]*corev1.ConfigMap,
+	configDescs []parametersv1alpha1.ComponentConfigDescription,
+	paramsDefs []*parametersv1alpha1.ParametersDefinition) error {
+	if values == nil {
+		return nil
+	}
+	if err := validateCustomTemplate(ctx, cli, values.Templates); err != nil {
+		return err
+	}
+	if len(values.Parameters) != 0 {
+		classifiedParameters, err := parameters.ClassifyComponentParameters(
+			parametersv1alpha1.ComponentParameters(values.Parameters),
+			paramsDefs,
+			fetchTask.ComponentDefObj.Spec.Configs,
+			configmaps,
+			configDescs,
+		)
+		if err != nil {
+			return intctrlutil.NewErrorf(intctrlutil.ErrorTypeFatal, "%s", err.Error())
+		}
+		for templateName, paramsInFile := range classifiedParameters {
+			configDescriptions := parameters.GetComponentConfigDescriptions(configDescs, templateName)
+			if len(configDescriptions) == 0 {
+				return intctrlutil.NewErrorf(intctrlutil.ErrorTypeFatal, "not found config description for template: %s", templateName)
+			}
+			if _, err := parameters.DoMerge(resolveBaseData(paramsInFile), parameters.DerefMapValues(paramsInFile), paramsDefs, configDescriptions); err != nil {
+				return intctrlutil.NewErrorf(intctrlutil.ErrorTypeFatal, "%s", err.Error())
+			}
+			item := parameters.GetConfigTemplateItem(spec, templateName)
+			if item == nil {
+				return intctrlutil.NewErrorf(intctrlutil.ErrorTypeFatal, "not found config template item: %s", templateName)
+			}
+			mergeItemParameters(item, parameters.DerefMapValues(paramsInFile), override)
+		}
+	}
+	for templateName, templateExtension := range values.Templates {
+		item := parameters.GetConfigTemplateItem(spec, templateName)
+		if item == nil {
+			return intctrlutil.NewErrorf(intctrlutil.ErrorTypeFatal, "not found config template item: %s", templateName)
+		}
+		if override || item.CustomTemplates == nil {
+			item.CustomTemplates = templateExtension.DeepCopy()
+		}
+	}
+	return nil
+}
+
+func resolveComponentRefConfigMap(ctx context.Context, cli client.Client, namespace, clusterName, componentName string) (map[string]*corev1.ConfigMap, error) {
+	configMapList := &corev1.ConfigMapList{}
+	if err := cli.List(ctx, configMapList,
+		client.InNamespace(namespace),
+		client.MatchingLabels(constant.GetCompLabels(clusterName, componentName)),
+		client.HasLabels([]string{
+			constant.AppInstanceLabelKey,
+			constant.KBAppComponentLabelKey,
+			constant.CMConfigurationTemplateNameLabelKey,
+			constant.CMConfigurationTypeLabelKey,
+			constant.CMConfigurationSpecProviderLabelKey,
+		}),
+	); err != nil {
+		return nil, err
+	}
+	configmaps := make(map[string]*corev1.ConfigMap, len(configMapList.Items))
+	for i := range configMapList.Items {
+		item := &configMapList.Items[i]
+		configmaps[item.Labels[constant.CMConfigurationSpecProviderLabelKey]] = item
+	}
+	return configmaps, nil
+}
+
+func mergeItemParameters(item *parametersv1alpha1.ConfigTemplateItemDetail, updatedParameters map[string]parametersv1alpha1.ParametersInFile, override bool) {
+	if item.ConfigFileParams == nil {
+		item.ConfigFileParams = updatedParameters
+		return
+	}
+	if !override && len(item.ConfigFileParams) != 0 {
+		return
+	}
+	for key, parametersInFile := range updatedParameters {
+		merged := item.ConfigFileParams[key]
+		if parametersInFile.Content != nil {
+			merged.Content = parametersInFile.Content
+		}
+		if merged.Parameters == nil && len(parametersInFile.Parameters) > 0 {
+			merged.Parameters = map[string]*string{}
+		}
+		for paramKey, paramValue := range parametersInFile.Parameters {
+			merged.Parameters[paramKey] = paramValue
+		}
+		item.ConfigFileParams[key] = merged
+	}
+}
+
+func resolveBaseData(updatedParameters map[string]*parametersv1alpha1.ParametersInFile) map[string]string {
+	baseData := make(map[string]string, len(updatedParameters))
+	for key := range updatedParameters {
+		baseData[key] = ""
+	}
+	return baseData
+}
+
 type Task struct {
 	parameters.ResourceFetcher[Task]
 
