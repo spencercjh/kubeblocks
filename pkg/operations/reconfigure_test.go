@@ -65,8 +65,8 @@ var _ = Describe("Reconfigure OpsRequest", func() {
 		testapps.ClearResources(&testCtx, generics.OpsRequestSignature, inNS, ml)
 		testapps.ClearResources(&testCtx, generics.ConfigMapSignature, inNS, ml)
 		testapps.ClearResources(&testCtx, generics.ParametersDefinitionSignature, ml)
-		testapps.ClearResources(&testCtx, generics.InstanceSetSignature, inNS, ml)
-		testapps.ClearResources(&testCtx, generics.ComponentParameterSignature, inNS)
+		testapps.ClearResourcesWithRemoveFinalizerOption(&testCtx, generics.InstanceSetSignature, true, inNS, ml)
+		testapps.ClearResourcesWithRemoveFinalizerOption(&testCtx, generics.ComponentParameterSignature, true, inNS)
 	}
 
 	BeforeEach(cleanEnv)
@@ -182,7 +182,7 @@ parameter: {
 
 			Eventually(testapps.CheckObj(&testCtx, client.ObjectKeyFromObject(componentParameter), func(g Gomega, cp *parametersv1alpha1.ComponentParameter) {
 				g.Expect(cp.Spec.Desired).ShouldNot(BeNil())
-				g.Expect(cp.Spec.Desired.Parameters).Should(HaveKeyWithValue("max_connections", pointer.String("200")))
+				g.Expect(cp.Spec.Desired.Assignments).Should(HaveKeyWithValue("max_connections", pointer.String("200")))
 			})).Should(Succeed())
 
 			Expect(testapps.GetAndChangeObjStatus(&testCtx, client.ObjectKeyFromObject(componentParameter), func(cp *parametersv1alpha1.ComponentParameter) {
@@ -199,7 +199,6 @@ parameter: {
 			Eventually(testops.GetOpsRequestPhase(&testCtx, client.ObjectKeyFromObject(opsRes.OpsRequest))).Should(Equal(opsv1alpha1.OpsSucceedPhase))
 
 			Expect(err).Should(BeNil())
-
 		})
 	})
 })

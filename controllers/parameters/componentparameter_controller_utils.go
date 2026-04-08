@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"slices"
 	"strconv"
 
 	corev1 "k8s.io/api/core/v1"
@@ -88,35 +89,38 @@ func reconcileParameterValuesIntoSpec(ctx context.Context, cli client.Client, co
 	if err != nil {
 		return false, err
 	}
-	if err := applyParameterValues(specCopy, compParam.Spec.Init, false, ctx, cli, fetchTask, configmaps, configDescs, paramsDefs); err != nil {
+	if err := applyParameterInputs(specCopy, compParam.Spec.Initial, false, ctx, cli, fetchTask, configmaps, configDescs, paramsDefs); err != nil {
 		return false, err
 	}
-	if err := applyParameterValues(specCopy, compParam.Spec.Desired, true, ctx, cli, fetchTask, configmaps, configDescs, paramsDefs); err != nil {
+	if err := applyParameterInputs(specCopy, compParam.Spec.Desired, true, ctx, cli, fetchTask, configmaps, configDescs, paramsDefs); err != nil {
 		return false, err
 	}
 	if reflect.DeepEqual(compParam.Spec, *specCopy) {
 		return false, nil
 	}
-	patch := client.MergeFrom(compParam.DeepCopy())
 	compParam.Spec = *specCopy
-	return true, cli.Patch(ctx, compParam, patch)
+	return true, cli.Update(ctx, compParam)
 }
 
-func applyParameterValues(spec *parametersv1alpha1.ComponentParameterSpec,
-	values *parametersv1alpha1.ParameterValues, override bool,
+func applyParameterInputs(spec *parametersv1alpha1.ComponentParameterSpec,
+	inputs *parametersv1alpha1.ParameterInputs, override bool,
 	ctx context.Context, cli client.Client, fetchTask *Task,
 	configmaps map[string]*corev1.ConfigMap,
 	configDescs []parametersv1alpha1.ComponentConfigDescription,
 	paramsDefs []*parametersv1alpha1.ParametersDefinition) error {
-	if values == nil {
+	if inputs == nil {
 		return nil
 	}
-	if err := validateCustomTemplate(ctx, cli, values.Templates); err != nil {
+	if err := validateCustomTemplate(ctx, cli, inputs.Templates); err != nil {
 		return err
 	}
-	if len(values.Parameters) != 0 {
+	managedInputs, err := normalizeManagedParameterInputs(inputs)
+	if err != nil {
+		return intctrlutil.NewErrorf(intctrlutil.ErrorTypeFatal, "%s", err.Error())
+	}
+	if len(managedInputs) != 0 {
 		classifiedParameters, err := parameters.ClassifyComponentParameters(
-			parametersv1alpha1.ComponentParameters(values.Parameters),
+			parametersv1alpha1.ComponentParameters(managedInputs),
 			paramsDefs,
 			fetchTask.ComponentDefObj.Spec.Configs,
 			configmaps,
@@ -130,17 +134,17 @@ func applyParameterValues(spec *parametersv1alpha1.ComponentParameterSpec,
 			if len(configDescriptions) == 0 {
 				return intctrlutil.NewErrorf(intctrlutil.ErrorTypeFatal, "not found config description for template: %s", templateName)
 			}
-			if _, err := parameters.DoMerge(resolveBaseData(paramsInFile), parameters.DerefMapValues(paramsInFile), paramsDefs, configDescriptions); err != nil {
-				return intctrlutil.NewErrorf(intctrlutil.ErrorTypeFatal, "%s", err.Error())
-			}
 			item := parameters.GetConfigTemplateItem(spec, templateName)
 			if item == nil {
 				return intctrlutil.NewErrorf(intctrlutil.ErrorTypeFatal, "not found config template item: %s", templateName)
 			}
+			if _, err := parameters.DoMerge(resolveBaseData(configmaps[templateName], paramsInFile), parameters.DerefMapValues(paramsInFile), paramsDefs, configDescriptions); err != nil {
+				return intctrlutil.NewErrorf(intctrlutil.ErrorTypeFatal, "%s", err.Error())
+			}
 			mergeItemParameters(item, parameters.DerefMapValues(paramsInFile), override)
 		}
 	}
-	for templateName, templateExtension := range values.Templates {
+	for templateName, templateExtension := range inputs.Templates {
 		item := parameters.GetConfigTemplateItem(spec, templateName)
 		if item == nil {
 			return intctrlutil.NewErrorf(intctrlutil.ErrorTypeFatal, "not found config template item: %s", templateName)
@@ -149,7 +153,118 @@ func applyParameterValues(spec *parametersv1alpha1.ComponentParameterSpec,
 			item.CustomTemplates = templateExtension.DeepCopy()
 		}
 	}
+	if err := applyUnmanagedParameterUpdates(spec, inputs.UnmanagedUpdates, override, configDescs, nil); err != nil {
+		return err
+	}
 	return nil
+}
+
+func normalizeManagedParameterInputs(inputs *parametersv1alpha1.ParameterInputs) (map[string]*string, error) {
+	if inputs == nil {
+		return nil, nil
+	}
+	if len(inputs.Assignments) == 0 && len(inputs.Updates) == 0 {
+		return nil, nil
+	}
+	normalized := make(map[string]*string, len(inputs.Assignments)+len(inputs.Updates))
+	for key, value := range inputs.Assignments {
+		normalized[key] = value
+	}
+	for _, update := range inputs.Updates {
+		switch update.Type {
+		case parametersv1alpha1.ParameterUpdateSet:
+			if update.Value == nil {
+				return nil, fmt.Errorf("parameter update %q with type %q requires a value", update.Key, update.Type)
+			}
+			normalized[update.Key] = update.Value
+		case parametersv1alpha1.ParameterUpdateRemove:
+			normalized[update.Key] = nil
+		default:
+			return nil, fmt.Errorf("unsupported parameter update type %q for key %q", update.Type, update.Key)
+		}
+	}
+	return normalized, nil
+}
+
+func applyUnmanagedParameterUpdates(spec *parametersv1alpha1.ComponentParameterSpec,
+	updates []parametersv1alpha1.UnmanagedParameterUpdate, override bool,
+	configDescs []parametersv1alpha1.ComponentConfigDescription,
+	_ []*parametersv1alpha1.ParametersDefinition) error {
+	if len(updates) == 0 {
+		return nil
+	}
+	for _, update := range updates {
+		if len(update.Updates) == 0 {
+			continue
+		}
+		item := parameters.GetConfigTemplateItem(spec, update.Template)
+		if item == nil {
+			return intctrlutil.NewErrorf(intctrlutil.ErrorTypeFatal, "not found config template item: %s", update.Template)
+		}
+		templateConfigDescs := parameters.GetComponentConfigDescriptions(configDescs, update.Template)
+		if len(templateConfigDescs) == 0 {
+			return intctrlutil.NewErrorf(intctrlutil.ErrorTypeFatal, "not found config description for template: %s", update.Template)
+		}
+		fileConfig := parameters.GetComponentConfigDescription(templateConfigDescs, update.File)
+		if fileConfig == nil {
+			return intctrlutil.NewErrorf(intctrlutil.ErrorTypeFatal, "not found config description for file: %s/%s", update.Template, update.File)
+		}
+		if err := validateUnmanagedSectionUpdates(update.Updates, fileConfig.FileFormatConfig); err != nil {
+			return intctrlutil.NewErrorf(intctrlutil.ErrorTypeFatal, "%s", err.Error())
+		}
+		mergeUnmanagedFileUpdates(item, update.File, update.Updates, override)
+	}
+	return nil
+}
+
+func validateUnmanagedSectionUpdates(updates []parametersv1alpha1.UnmanagedParameterSectionUpdate, base *parametersv1alpha1.FileFormatConfig) error {
+	for _, sectionUpdate := range updates {
+		if sectionUpdate.Section != nil {
+			if base == nil {
+				return fmt.Errorf("section is not supported without file format configuration")
+			}
+			if base.Format != parametersv1alpha1.Ini {
+				return fmt.Errorf("section is only supported for ini unmanaged updates")
+			}
+		}
+		if len(sectionUpdate.Updates) == 0 {
+			continue
+		}
+		if _, err := normalizeUnmanagedParameterUpdates(sectionUpdate.Updates); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func normalizeUnmanagedParameterUpdates(updates []parametersv1alpha1.ParameterUpdate) (map[string]*string, error) {
+	normalized := make(map[string]*string, len(updates))
+	for _, update := range updates {
+		switch update.Type {
+		case parametersv1alpha1.ParameterUpdateSet:
+			if update.Value == nil {
+				return nil, fmt.Errorf("unmanaged parameter update %q with type %q requires a value", update.Key, update.Type)
+			}
+			normalized[update.Key] = update.Value
+		case parametersv1alpha1.ParameterUpdateRemove:
+			normalized[update.Key] = nil
+		default:
+			return nil, fmt.Errorf("unsupported unmanaged parameter update type %q for key %q", update.Type, update.Key)
+		}
+	}
+	return normalized, nil
+}
+
+func mergeUnmanagedFileUpdates(item *parametersv1alpha1.ConfigTemplateItemDetail, file string, updates []parametersv1alpha1.UnmanagedParameterSectionUpdate, override bool) {
+	if item.ConfigFileParams == nil {
+		item.ConfigFileParams = map[string]parametersv1alpha1.ParametersInFile{}
+	}
+	merged := item.ConfigFileParams[file]
+	if len(merged.UnmanagedUpdates) != 0 && !override {
+		return
+	}
+	merged.UnmanagedUpdates = slices.Clone(updates)
+	item.ConfigFileParams[file] = merged
 }
 
 func resolveComponentRefConfigMap(ctx context.Context, cli client.Client, namespace, clusterName, componentName string) (map[string]*corev1.ConfigMap, error) {
@@ -188,19 +303,36 @@ func mergeItemParameters(item *parametersv1alpha1.ConfigTemplateItemDetail, upda
 		if parametersInFile.Content != nil {
 			merged.Content = parametersInFile.Content
 		}
-		if merged.Parameters == nil && len(parametersInFile.Parameters) > 0 {
-			merged.Parameters = map[string]*string{}
-		}
-		for paramKey, paramValue := range parametersInFile.Parameters {
-			merged.Parameters[paramKey] = paramValue
+		if override {
+			encodedParameters := parameters.EncodeParameterOverlay(parametersInFile.Parameters)
+			if len(encodedParameters) == 0 {
+				merged.Parameters = nil
+			} else {
+				merged.Parameters = make(map[string]*string, len(encodedParameters))
+				for paramKey, paramValue := range encodedParameters {
+					merged.Parameters[paramKey] = paramValue
+				}
+			}
+		} else {
+			encodedParameters := parameters.EncodeParameterOverlay(parametersInFile.Parameters)
+			if merged.Parameters == nil && len(encodedParameters) > 0 {
+				merged.Parameters = map[string]*string{}
+			}
+			for paramKey, paramValue := range encodedParameters {
+				merged.Parameters[paramKey] = paramValue
+			}
 		}
 		item.ConfigFileParams[key] = merged
 	}
 }
 
-func resolveBaseData(updatedParameters map[string]*parametersv1alpha1.ParametersInFile) map[string]string {
+func resolveBaseData(configmap *corev1.ConfigMap, updatedParameters map[string]*parametersv1alpha1.ParametersInFile) map[string]string {
 	baseData := make(map[string]string, len(updatedParameters))
 	for key := range updatedParameters {
+		if configmap != nil {
+			baseData[key] = configmap.Data[key]
+			continue
+		}
 		baseData[key] = ""
 	}
 	return baseData
