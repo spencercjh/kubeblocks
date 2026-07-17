@@ -27,6 +27,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	"github.com/stretchr/testify/assert"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -143,6 +144,10 @@ func TestRequestBuildBackupDataActions(t *testing.T) {
 }
 
 func TestRequestBuildActionsIncludesPreAndPostHooks(t *testing.T) {
+	oldNamespace := viper.GetString(constant.CfgKeyCtrlrMgrNS)
+	defer viper.Set(constant.CfgKeyCtrlrMgrNS, oldNamespace)
+	viper.Set(constant.CfgKeyCtrlrMgrNS, "kb-system")
+
 	req, pod := newRequestTestFixture(t)
 	req.ActionSet = &dpv1alpha1.ActionSet{Spec: dpv1alpha1.ActionSetSpec{
 		BackupType: dpv1alpha1.BackupTypeFull,
@@ -159,6 +164,18 @@ func TestRequestBuildActionsIncludesPreAndPostHooks(t *testing.T) {
 	assert.Equal(t, dpv1alpha1.ActionTypeJob, actions[pod.Name][0].Type())
 	assert.Equal(t, dpv1alpha1.ActionTypeJob, actions[pod.Name][1].Type())
 	assert.Equal(t, dpv1alpha1.ActionTypeJob, actions[pod.Name][2].Type())
+	for i, act := range actions[pod.Name] {
+		objectRef := act.BuildObjectRef()
+		assert.NotNil(t, objectRef)
+		assert.Equal(t, batchv1.SchemeGroupVersion.String(), objectRef.APIVersion)
+		assert.Equal(t, constant.JobKind, objectRef.Kind)
+		assert.Equal(t, GenerateBackupJobName(req.Backup, act.GetName()), objectRef.Name)
+		if i == 0 {
+			assert.Equal(t, "kb-system", objectRef.Namespace)
+		} else {
+			assert.Equal(t, req.Namespace, objectRef.Namespace)
+		}
+	}
 }
 
 var _ = Describe("Request Test", func() {
